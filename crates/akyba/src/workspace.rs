@@ -1005,13 +1005,50 @@ struct GridGeometry {
     scroll: f32,
     max: f32,
     panes: Vec<(CellId, Span)>,
+    /// How far round a looping grid goes before it repeats; none while it stops at its ends. On a
+    /// loop, `scroll` is how far round the window is.
+    ring: Option<f32>,
 }
 
 impl GridGeometry {
+    /// Where a pane sits; on a loop, its copy nearest the window.
     fn span_of(&self, cell: CellId) -> Option<Span> {
-        self.panes.iter().find(|(id, _)| *id == cell).map(|(_, span)| *span)
+        let span = self.panes.iter().find(|(id, _)| *id == cell).map(|(_, span)| *span)?;
+        Some(match self.ring {
+            Some(ring) => grid_scroll::nearest_copy(span, self.scroll, self.viewport, ring),
+            None => span,
+        })
     }
 }
+
+/// A grid that loops, the first pane coming round after the last.
+#[derive(Clone, Copy)]
+struct GridLoop {
+    /// How wide the grid is, every pane at a readable width.
+    width: f32,
+    /// The gap where the last pane meets the first: wider than the others when it's marked, so
+    /// the mark stands on its own rather than against a pane's edge.
+    seam: f32,
+    /// How far round it goes before it repeats: its width and the seam.
+    ring: f32,
+}
+
+impl GridLoop {
+    /// How wide a row is, drawn from any pane round to the one before it: the seam takes the
+    /// place of one ordinary gap.
+    fn row_width(self, gap: f32) -> f32 {
+        self.width - gap + self.seam
+    }
+}
+
+/// How tall Akyba's mark is on the strip where a looping grid starts again.
+const LOOP_MARK: f32 = 14.;
+/// How wide the marked seam is: the strip, and a gap either side of it.
+const LOOP_SEAM: f32 = 44.;
+
+/// How many turns of a looping grid the scroll track holds. The window is kept in the second turn,
+/// so a swipe never meets an end, and moving it by whole turns can't be seen.
+const LOOP_TURNS: f32 = 4.;
 
 /// What a pane adds to its terminal's columns: the panel's padding and the well's inset.
 const PANE_FRAME: f32 = 28.;
@@ -4203,23 +4240,40 @@ impl Workspace {
             .into_any_element()
     }
 
+    #[expect(clippy::too_many_lines, reason = "one grid, its rows and their loop, read top to bottom")]
     fn render_grid(&self, cx: &mut Context<Self>) -> AnyElement {
         let maximized = self.layout.maximized;
         let row_sizes: Vec<f32> = self.layout.rows.iter().map(|row| row.size).collect();
         // As wide as the window, or wider when the panes would get too narrow to read; the window
         // then scrolls along it.
         let narrowest = self.grid_min_width(cx);
-        let mut grid = div().id("grid").flex().flex_col().flex_none().w_full().min_w(px(narrowest)).on_drag_move(
-            cx.listener(move |this, event: &DragMoveEvent<GridDivider>, _, cx| {
-                if let GridDivider::Rows(index) = *event.drag(cx) {
-                    let at =
-                        f32::from(event.event.position.y - event.bounds.top()) / f32::from(event.bounds.size.height);
-                    let sizes = move_divider(&row_sizes, index, at);
-                    this.layout.resize_rows(&sizes);
-                    cx.notify();
-                }
-            }),
-        );
+        let looping = self.grid_loop(cx);
+        let gap = chrome::pane_gap();
+        // On a loop, GPUI still scrolls a long track, with its momentum and its sideways lock;
+        // Akyba keeps the window in the track's second turn, and draws the grid where the window
+        // is, each row starting with the pane at its left edge.
+        let mut scrolled = -f32::from(self.grid_scroll.offset().x);
+        if let Some(looping) = looping {
+            let anchored = looping.ring + scrolled.rem_euclid(looping.ring);
+            if (anchored - scrolled).abs() > 0.5 {
+                self.grid_scroll.set_offset(point(px(-anchored), self.grid_scroll.offset().y));
+                scrolled = anchored;
+            }
+        }
+        let phase = looping.map_or(0., |looping| scrolled.rem_euclid(looping.ring));
+        let mut grid = div().id("grid").flex().flex_col().flex_none();
+        grid = match looping {
+            Some(looping) => grid.absolute().top_0().bottom_0().left(px(scrolled)).w(px(looping.row_width(gap))),
+            None => grid.w_full().min_w(px(narrowest)),
+        };
+        grid = grid.on_drag_move(cx.listener(move |this, event: &DragMoveEvent<GridDivider>, _, cx| {
+            if let GridDivider::Rows(index) = *event.drag(cx) {
+                let at = f32::from(event.event.position.y - event.bounds.top()) / f32::from(event.bounds.size.height);
+                let sizes = move_divider(&row_sizes, index, at);
+                this.layout.resize_rows(&sizes);
+                cx.notify();
+            }
+        }));
         // A maximised pane stands back from the edges, so what it covers reads as hidden, not gone.
         if maximized.is_some() {
             grid = grid.p(len(space::SPACE_6));
@@ -4234,25 +4288,51 @@ impl Workspace {
             }
             let row_id = row.id;
             let cell_sizes: Vec<f32> = row.cells.iter().map(|cell| cell.size).collect();
+            // On a loop the row starts with the pane at the window's left edge, the rest after it
+            // and round again; `base` is where that pane sits along the unrolled grid.
+            let (first, base) = match looping {
+                Some(looping) => {
+                    let spans = grid_scroll::spans(&cell_sizes, looping.width, gap);
+                    let (first, _) = grid_scroll::row_start(&spans, phase, gap);
+                    (first, spans.get(first).map_or(0., |span| span.left))
+                }
+                None => (0, 0.),
+            };
+            let ring = looping.map(|looping| (looping.ring, looping.width));
             let mut row_element =
                 div().id(("row", row_id.key())).flex().min_h_0().flex_basis(relative(0.)).on_drag_move(cx.listener(
                     move |this, event: &DragMoveEvent<GridDivider>, _, cx| {
                         if let GridDivider::Cells(dragged_row, index) = *event.drag(cx)
                             && dragged_row == row_id
                         {
-                            let at = f32::from(event.event.position.x - event.bounds.left())
-                                / f32::from(event.bounds.size.width);
+                            let x = f32::from(event.event.position.x - event.bounds.left());
+                            // On a loop, back from where it's drawn to where it sits unrolled.
+                            let at = match ring {
+                                Some((ring, width)) => (x + base).rem_euclid(ring) / width,
+                                None => x / f32::from(event.bounds.size.width),
+                            };
                             let sizes = move_divider(&cell_sizes, index, at);
                             this.layout.resize_cells(row_id, &sizes);
                             cx.notify();
                         }
                     },
                 ));
+            if let Some(looping) = looping {
+                row_element = row_element.w(px(looping.row_width(gap))).ml(px(base - phase));
+            }
             row_element.style().flex_grow = Some(if maximized.is_some() { 1.0 } else { row.size });
-            for (cell_index, cell) in shown.into_iter().enumerate() {
-                if cell_index > 0 && maximized.is_none() {
-                    row_element =
-                        row_element.child(Self::render_divider(GridDivider::Cells(row_id, cell_index - 1), true, cx));
+            let count = shown.len();
+            let order = (first..count).chain(0..first);
+            for (drawn, cell_index) in order.enumerate() {
+                let cell = shown[cell_index];
+                if drawn > 0 && maximized.is_none() {
+                    // The seam, where the last pane meets the first, is a plain gap: dividers
+                    // resize the panes either side of them, and those two aren't neighbours.
+                    row_element = if cell_index == 0 {
+                        row_element.child(self.render_loop_seam(looping.map_or(gap, |looping| looping.seam), gap))
+                    } else {
+                        row_element.child(Self::render_divider(GridDivider::Cells(row_id, cell_index - 1), true, cx))
+                    };
                 }
                 let mut cell_element =
                     div().flex().min_w_0().flex_basis(relative(0.)).child(self.render_cell(cell, cx));
@@ -4279,9 +4359,30 @@ impl Workspace {
                     // doesn't drift while the grid moves, nor the grid while a history scrolls.
                     .restrict_scroll_to_axis()
                     .track_scroll(&self.grid_scroll)
-                    .child(grid),
+                    .map(|scroller| match looping {
+                        Some(looping) => {
+                            scroller.child(div().relative().flex_none().w(px(looping.ring * LOOP_TURNS)).child(grid))
+                        }
+                        None => scroller.child(grid),
+                    }),
             )
             .children(edges)
+            .into_any_element()
+    }
+
+    /// The gap where a looping row's last pane meets its first: a strip with Akyba's mark when the
+    /// setting asks for one, so the start of the loop can be found again.
+    fn render_loop_seam(&self, seam_width: f32, gap: f32) -> AnyElement {
+        div()
+            .flex_none()
+            .w(len(seam_width))
+            .flex()
+            .justify_center()
+            .items_center()
+            .when(self.settings.terminal.mark_loop_seam, |seam| {
+                // A gap in from either pane, as panes sit a gap apart.
+                seam.child(chrome::loop_strip(LOOP_MARK).w(px(seam_width - 2. * gap)))
+            })
             .into_any_element()
     }
 
@@ -4317,8 +4418,14 @@ impl Workspace {
     fn grid_geometry(&self, cx: &gpui_kit::App) -> GridGeometry {
         let viewport = f32::from(self.grid_scroll.bounds().size.width);
         let width = viewport.max(self.grid_min_width(cx));
-        let max = (width - viewport).max(0.);
-        let scroll = (-f32::from(self.grid_scroll.offset().x)).clamp(0., max);
+        let looping = self.grid_loop(cx);
+        let scrolled = -f32::from(self.grid_scroll.offset().x);
+        let (scroll, max) = if let Some(looping) = looping {
+            (scrolled.rem_euclid(looping.ring), looping.ring)
+        } else {
+            let max = (width - viewport).max(0.);
+            (scrolled.clamp(0., max), max)
+        };
         let gap = chrome::pane_gap();
         let mut panes = Vec::new();
         for row in &self.layout.rows {
@@ -4326,33 +4433,79 @@ impl Workspace {
             let spans = grid_scroll::spans(&sizes, width, gap);
             panes.extend(row.cells.iter().map(|cell| cell.id).zip(spans));
         }
-        GridGeometry { viewport, scroll, max, panes }
+        GridGeometry { viewport, scroll, max, panes, ring: looping.map(|looping| looping.ring) }
     }
 
-    /// Scrolls the grid so the focused pane is wholly in sight, when it isn't.
+    /// The grid's loop, when it scrolls sideways and is wide enough that every row, started at any
+    /// pane, still fills the window: narrower, pane one would have to show at both edges at once.
+    fn grid_loop(&self, cx: &gpui_kit::App) -> Option<GridLoop> {
+        let terminal = &self.settings.terminal;
+        if !terminal.scroll_grid || !terminal.loop_grid || self.layout.maximized.is_some() {
+            return None;
+        }
+        let viewport = f32::from(self.grid_scroll.bounds().size.width);
+        let width = viewport.max(self.grid_min_width(cx));
+        let gap = chrome::pane_gap();
+        let widest = self
+            .layout
+            .rows
+            .iter()
+            .flat_map(|row| {
+                let sizes: Vec<f32> = row.cells.iter().map(|cell| cell.size).collect();
+                grid_scroll::spans(&sizes, width, gap)
+            })
+            .map(Span::width)
+            .fold(0., f32::max);
+        grid_scroll::loops(width, viewport, widest, gap).then(|| {
+            let seam = if terminal.mark_loop_seam { LOOP_SEAM } else { gap };
+            GridLoop { width, seam, ring: grid_scroll::ring(width, seam) }
+        })
+    }
+
+    /// Scrolls the grid so the focused pane is wholly in sight, when it isn't; on a loop, the
+    /// shorter way round.
     fn reveal_focused(&mut self, cx: &mut Context<Self>) {
         let Some(focused) = self.layout.focused else { return };
         let geometry = self.grid_geometry(cx);
         let Some(span) = geometry.span_of(focused) else { return };
-        if let Some(to) = grid_scroll::reveal(span, geometry.scroll, geometry.viewport, geometry.max) {
-            self.glide_grid(to, cx);
+        let to = if geometry.ring.is_some() {
+            grid_scroll::reveal_on_loop(span, geometry.scroll, geometry.viewport)
+        } else {
+            grid_scroll::reveal(span, geometry.scroll, geometry.viewport, geometry.max)
+        };
+        if let Some(to) = to {
+            self.glide_grid(to - geometry.scroll, cx);
         }
     }
 
-    /// Moves the grid to `to` (how far scrolled) in a few quick frames, easing out.
-    fn glide_grid(&mut self, to: f32, cx: &mut Context<Self>) {
-        let from = -f32::from(self.grid_scroll.offset().x);
-        if (to - from).abs() < 1. {
+    /// Glides the grid sideways, for a spike.
+    pub fn spike_scroll_grid(&mut self, by: f32, cx: &mut Context<Self>) {
+        self.glide_grid(by, cx);
+    }
+
+    /// Moves the grid `by` that far in a few quick frames, easing out. Each frame adds its step to
+    /// wherever the grid is, so a loop moved by whole turns on the way doesn't throw it off.
+    fn glide_grid(&mut self, by: f32, cx: &mut Context<Self>) {
+        if by.abs() < 1. {
             self.grid_motion = None;
             return;
         }
+        // A grid that stops at its ends may hold an offset past one, set before GPUI clamped it;
+        // start from where the grid shows, or the first frames would move nothing.
+        let geometry = self.grid_geometry(cx);
+        if geometry.ring.is_none() {
+            self.grid_scroll.set_offset(point(px(-geometry.scroll), self.grid_scroll.offset().y));
+        }
         let handle = self.grid_scroll.clone();
         self.grid_motion = Some(cx.spawn(async move |this, cx| {
+            let mut moved = 0.;
             for step in 1..=GLIDE_STEPS {
                 cx.background_executor().timer(Duration::from_millis(16)).await;
                 let progress = f32::from(step) / f32::from(GLIDE_STEPS);
                 let eased = 1. - (1. - progress).powi(3);
-                handle.set_offset(point(px(-(from + (to - from) * eased)), handle.offset().y));
+                let offset = handle.offset();
+                handle.set_offset(point(offset.x - px(by * eased - moved), offset.y));
+                moved = by * eased;
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
                     return;
                 }

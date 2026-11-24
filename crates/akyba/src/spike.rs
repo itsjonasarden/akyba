@@ -47,6 +47,8 @@
 //! - `AKYBA_MAXIMIZE_PANE=1` maximises the focused pane, over the grid and the panels.
 //! - `AKYBA_MENU=new-agent|pane|repo` opens that button's menu after 2 seconds (`AKYBA_MENU_PICK=2`
 //!   picks its third line instead).
+//! - `AKYBA_GRID_SCROLL=900` glides the grid that many pixels sideways after 2 seconds (negative
+//!   goes left), to see a looping grid's seam.
 //! - `AKYBA_SCREENSHOT=path.png` saves what the window draws after `AKYBA_SCREENSHOT_AFTER`
 //!   seconds (needs the `capture` feature); `AKYBA_QUIT_AFTER` quits after that many seconds.
 
@@ -209,6 +211,7 @@ pub fn start(workspace: &Workspace, window: &mut Window, cx: &mut Context<Worksp
         .detach();
     }
     maximize_from_env(window, cx);
+    grid_scroll_from_env(cx);
     if std::env::var_os("AKYBA_PROBLEMS").is_some() {
         // Once the opened file's server has reported.
         cx.spawn(async move |workspace, cx| {
@@ -253,6 +256,16 @@ fn rebind_from_env(workspace: &Workspace, cx: &mut Context<Workspace>) {
         after.insert(id, keys);
         crate::keymap::rebind(shortcut, &before, &after, cx);
     }
+}
+
+/// `AKYBA_GRID_SCROLL`: the grid glided sideways that far, after two seconds.
+fn grid_scroll_from_env(cx: &mut Context<Workspace>) {
+    let Some(by) = var::<f32>("AKYBA_GRID_SCROLL") else { return };
+    cx.spawn(async move |workspace, cx| {
+        cx.background_executor().timer(Duration::from_secs(2)).await;
+        let _ = workspace.update(cx, |workspace, cx| workspace.spike_scroll_grid(by, cx));
+    })
+    .detach();
 }
 
 /// `AKYBA_MAXIMIZE_PANE`: the focused pane maximised; `AKYBA_MAXIMIZE_EDITOR`: the editor in the grid's room.

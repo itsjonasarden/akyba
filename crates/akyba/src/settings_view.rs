@@ -451,6 +451,22 @@ impl SettingsView {
             ),
             Row::new(
                 Section::Terminal,
+                "Loop panes sideways",
+                "After the last pane the first comes round again, both ways, so the grid has no ends. Only while the grid is at least a pane wider than the window.",
+                self.switch("loop-grid", settings.terminal.loop_grid, |settings, on| {
+                    settings.terminal.loop_grid = on;
+                }),
+            ),
+            Row::new(
+                Section::Terminal,
+                "Mark where the loop starts",
+                "A strip with Akyba's mark where the last pane meets the first, so you can tell where you are.",
+                self.switch("mark-loop-seam", settings.terminal.mark_loop_seam, |settings, on| {
+                    settings.terminal.mark_loop_seam = on;
+                }),
+            ),
+            Row::new(
+                Section::Terminal,
                 "Narrowest pane",
                 "How many characters wide a pane stays at least while the grid scrolls sideways.",
                 self.choice(

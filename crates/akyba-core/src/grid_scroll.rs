@@ -71,12 +71,46 @@ pub fn hidden_side(span: Span, scroll: f32, viewport: f32) -> Option<Side> {
 /// How far to scroll for a pane to be wholly in sight, moving as little as it can; none when it
 /// already is. A pane wider than the window shows from its left edge.
 pub fn reveal(span: Span, scroll: f32, viewport: f32, max: f32) -> Option<f32> {
+    reveal_on_loop(span, scroll, viewport).map(|to| to.clamp(0., max))
+}
+
+/// As `reveal`, on a grid that loops: no end to stop at, so the answer can be anywhere along it.
+pub fn reveal_on_loop(span: Span, scroll: f32, viewport: f32) -> Option<f32> {
     let in_sight = span.left >= scroll - 0.5 && span.right <= scroll + viewport + 0.5;
     if in_sight {
         return None;
     }
-    let to = if span.left < scroll || span.width() > viewport { span.left } else { span.right - viewport };
-    Some(to.clamp(0., max))
+    Some(if span.left < scroll || span.width() > viewport { span.left } else { span.right - viewport })
+}
+
+/// Whether the grid can loop, the first pane coming round again after the last. Each row is drawn
+/// once, starting with the pane at the window's left edge, so even a row that starts just inside
+/// its widest pane must still reach the window's right edge.
+pub fn loops(width: f32, viewport: f32, widest: f32, gap: f32) -> bool {
+    viewport > 0. && width - widest - gap >= viewport
+}
+
+/// How far the grid goes round before it repeats: its width and the gap at the seam.
+pub fn ring(width: f32, gap: f32) -> f32 {
+    width + gap
+}
+
+/// Where a looping row starts drawing: the pane at the window's left edge (each pane owning the gap
+/// after it, the last one the seam's), and how far the window starts past that pane's left edge.
+/// `phase` is how far round the ring the window is, from zero up to the ring's length.
+pub fn row_start(spans: &[Span], phase: f32, gap: f32) -> (usize, f32) {
+    let index = spans.iter().position(|span| phase < span.right + gap).unwrap_or(spans.len().saturating_sub(1));
+    (index, spans.get(index).map_or(0., |span| phase - span.left))
+}
+
+/// The copy of a pane on a looping grid nearest the middle of the window: the one to show, or to
+/// call the agent in from the nearer side.
+pub fn nearest_copy(span: Span, scroll: f32, viewport: f32, ring: f32) -> Span {
+    if ring <= 0. {
+        return span;
+    }
+    let turns = ((scroll + viewport / 2. - span.center()) / ring).round();
+    Span { left: span.left + turns * ring, right: span.right + turns * ring }
 }
 
 #[cfg(test)]
@@ -119,5 +153,36 @@ mod tests {
         assert_eq!(reveal(pane, 400., 1200., 2000.), None);
         assert_eq!(reveal(pane, 0., 1200., 2000.), Some(300.));
         assert_eq!(reveal(pane, 1200., 1200., 2000.), Some(1000.));
+    }
+
+    #[test]
+    fn a_grid_loops_only_when_every_row_still_covers_the_window() {
+        assert!(loops(2000., 1200., 500., 4.));
+        assert!(!loops(1600., 1200., 500., 4.));
+        assert!(!loops(2000., 0., 500., 4.));
+    }
+
+    #[test]
+    fn a_looping_row_starts_with_the_pane_at_the_left_edge() {
+        let spans = spans(&[1., 1., 1.], 1508., 4.);
+        // Panes at 0..500, 504..1004, 1008..1508; the ring is 1512 long.
+        assert_eq!(row_start(&spans, 0., 4.), (0, 0.));
+        assert_eq!(row_start(&spans, 502., 4.), (0, 502.));
+        assert_eq!(row_start(&spans, 600., 4.), (1, 96.));
+        assert_eq!(row_start(&spans, 1509., 4.), (2, 501.));
+    }
+
+    #[test]
+    fn the_nearest_copy_is_the_one_closest_to_the_window() {
+        let first = Span { left: 0., right: 500. };
+        let near = nearest_copy(first, 1400., 1000., 2000.);
+        assert!((near.left - 2000.).abs() < 0.01);
+        assert_eq!(nearest_copy(first, 0., 1000., 2000.), first);
+    }
+
+    #[test]
+    fn revealing_on_a_loop_never_stops_at_an_end() {
+        let pane = Span { left: -600., right: -100. };
+        assert_eq!(reveal_on_loop(pane, 0., 1200.), Some(-600.));
     }
 }

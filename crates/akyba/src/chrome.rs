@@ -754,6 +754,21 @@ pub fn mark(height: f32) -> impl IntoElement {
         .text_color(theme::color(color::INK))
 }
 
+/// Where a looping grid starts again: a strip as tall as the panes with Akyba's mark at its middle,
+/// quiet, since it tells where you are and isn't something to press. Saturn's is a soft track;
+/// Cyberdeck's a grey slab with its top right cut, as its panels are.
+pub fn loop_strip(mark_height: f32) -> gpui_kit::Div {
+    let quiet_mark = div().opacity(0.45).child(mark(mark_height));
+    let strip = div().flex().flex_col().items_center().justify_center().h_full();
+    if !cut_corners() {
+        return strip.rounded(theme::corner(radius::RADIUS_MD)).bg(theme::tone(tone::TRACK)).child(quiet_mark);
+    }
+    strip
+        .relative()
+        .child(cut_surface(theme::tone(tone::OUTLINE), theme::tone(tone::FAINT), 1., control_cut(), Cut::TopRight))
+        .child(quiet_mark)
+}
+
 pub fn headline(light: &str, bold: &str, size: f32) -> impl IntoElement {
     div()
         .flex()

@@ -11,7 +11,8 @@ panels (sidebar, editor, tickets) were showing, so Akyba opens with the same one
   line numbers, indent guides, visible whitespace, tab width.
 - **Terminal**: Option as Meta (Option+B jumps a word back in the shell) instead of typing the
   characters your keyboard layout puts on it; copy on select; scrolling panes sideways (on, or every pane squeezed
-  into the window) and how narrow a pane may get before the grid scrolls (80 characters). Inside Claude Code, dragging selects
+  into the window), looping them (off) with a strip with Akyba's mark where the loop starts (on), and
+  how narrow a pane may get before the grid scrolls (80 characters). Inside Claude Code, dragging selects
   in Claude itself and copies what you select; hold Shift or Option to select with Akyba instead.
   Dropping files (a screenshot, say) on a terminal types their paths, so the agent attaches them;
   the terminal they'll land in lights up while you drag.
