@@ -33,6 +33,9 @@ yanked = "warn"
 # Vulnerabilities fail everywhere. "Unmaintained" notices count only for crates Akyba depends on
 # directly: the deep ones come through GPUI (font parsing, Linux D-Bus) and are upstream's to replace.
 unmaintained = "workspace"
+# chrono is unmaintained, with nothing to upgrade to yet; Akyba only formats and reads local dates
+# with it. Replace it when its successor settles.
+ignore = [{ id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, no successor yet" }]
 
 [sources]
 unknown-registry = "deny"
