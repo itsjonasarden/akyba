@@ -80,6 +80,10 @@ Each pane shows whether its agent is working, waiting for you, done or failed.
   Shift and the wheel. It stays where you leave it, and going to a pane out of sight scrolls
   it into view. Turn it off and on with ⌘⌥G, the status bar's toggle or Terminal → Scroll Panes
   Sideways; off, every pane is squeezed into the window.
+- Turn on Settings → Terminal → Loop panes sideways, and the grid has no ends: after the last pane
+  the first comes round again, both ways. It loops while the grid is at least a pane wider than the
+  window. A strip with Akyba's mark sits where the last pane meets the first (Mark where the loop
+  starts).
 - A real terminal underneath (alacritty's engine), so TUIs, colours and the mouse work as they should.
 - Drop a file, a screenshot say, on a terminal to type its path, so the agent attaches it; the
   terminal it will land in lights up while you drag. Pasting works the same: copied files (from

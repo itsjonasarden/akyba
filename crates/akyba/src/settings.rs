@@ -129,6 +129,7 @@ impl Default for EditorSettings {
 }
 
 /// How the terminals behave.
+#[expect(clippy::struct_excessive_bools, reason = "independent on/off switches, each its own JSON field")]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
@@ -140,6 +141,12 @@ pub struct TerminalSettings {
     /// Panes keep `narrowest_pane` characters at least, and the grid scrolls sideways when more
     /// are in a row than fit. Off: every pane is squeezed into the window.
     pub scroll_grid: bool,
+    /// The sideways grid has no ends: after the last pane the first comes round again, both ways.
+    /// Only when the grid is at least a pane wider than the window, so no pane shows twice.
+    pub loop_grid: bool,
+    /// A strip with Akyba's mark where a looping grid's last pane meets its first, to tell where
+    /// it starts. Off: an ordinary gap.
+    pub mark_loop_seam: bool,
     /// How many characters wide a pane stays at least, while the grid scrolls. Zero, as an
     /// earlier Akyba wrote "Fit", squeezes them all in.
     pub narrowest_pane: u16,
@@ -147,7 +154,14 @@ pub struct TerminalSettings {
 
 impl Default for TerminalSettings {
     fn default() -> Self {
-        Self { option_as_meta: false, copy_on_select: false, scroll_grid: true, narrowest_pane: NARROWEST_PANE }
+        Self {
+            option_as_meta: false,
+            copy_on_select: false,
+            scroll_grid: true,
+            loop_grid: false,
+            mark_loop_seam: true,
+            narrowest_pane: NARROWEST_PANE,
+        }
     }
 }
 
