@@ -33,6 +33,11 @@ yanked = "warn"
 # Vulnerabilities fail everywhere. "Unmaintained" notices count only for crates Akyba depends on
 # directly: the deep ones come through GPUI (font parsing, Linux D-Bus) and are upstream's to replace.
 unmaintained = "workspace"
+ignore = [
+  # chrono has no maintained successor yet, and GPUI depends on it too, so dropping it from
+  # akyba-core (routines' schedules) would not remove it. Revisit when GPUI moves off it.
+  { id = "RUSTSEC-2026-0543", reason = "unmaintained, no replacement; GPUI depends on it too" },
+]
 
 [sources]
 unknown-registry = "deny"
