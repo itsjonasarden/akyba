@@ -108,9 +108,13 @@ impl Ignored {
         Self(builder.build().unwrap_or_else(|_| ignore::gitignore::Gitignore::empty()))
     }
 
-    /// Whether `path`, or a folder it is in, is ignored. Paths outside the root never are.
+    /// Whether `path`, or a folder it is in, is ignored. Paths outside the root never are. Read
+    /// from the path alone, never the disk, so tens of thousands of a build's files are told apart
+    /// in a moment. Asking the disk whether the path is a folder would only catch an ignored
+    /// folder itself under a folder-only rule (`target/`), and whatever is inside it is caught by
+    /// its parent anyway.
     pub fn is_ignored(&self, path: &Path) -> bool {
-        path.starts_with(self.0.path()) && self.0.matched_path_or_any_parents(path, path.is_dir()).is_ignore()
+        path.starts_with(self.0.path()) && self.0.matched_path_or_any_parents(path, false).is_ignore()
     }
 }
 

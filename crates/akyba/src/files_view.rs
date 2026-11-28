@@ -47,7 +47,6 @@ pub struct FilesView {
     rows: Vec<Row>,
     changes: HashMap<PathBuf, FileState>,
     selected: Option<PathBuf>,
-    ignored: Ignored,
     /// The menu a right click opened: on which entry (`None`: the folder's empty space), and where.
     menu: Option<(Option<Row>, Point<Pixels>)>,
     /// Kept alive for as long as the view watches its root.
@@ -61,10 +60,16 @@ impl FilesView {
         let mut tree = FileTree::new(root.to_owned());
         let rows = tree.rows();
         let (sender, events) = async_channel::unbounded::<PathBuf>();
+        // A build or an install writes tens of thousands of ignored files at once (`target/`,
+        // `node_modules/`). They're dropped here, on the watcher's own thread, by their path
+        // alone, so they never queue up or reach the window.
+        let ignored = Ignored::new(root);
         let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
             if let Ok(event) = event {
                 for path in event.paths {
-                    let _ = sender.send_blocking(path);
+                    if !ignored.is_ignored(&path) {
+                        let _ = sender.send_blocking(path);
+                    }
                 }
             }
         })
@@ -77,28 +82,24 @@ impl FilesView {
                 while let Ok(path) = events.try_recv() {
                     batch.push(path);
                 }
-                if this.update(cx, |this, cx| this.files_changed(&batch, cx)).is_err() {
+                // A file saved many times in the batch counts once.
+                let changed: Vec<PathBuf> = batch.into_iter().collect::<HashSet<_>>().into_iter().collect();
+                if this.update(cx, |this, cx| this.files_changed(&changed, cx)).is_err() {
                     break;
                 }
             }
         })
         .detach();
-        let ignored = Ignored::new(root);
-        let mut view =
-            Self { tree, rows, changes: HashMap::new(), selected: None, ignored, menu: None, _watcher: watcher };
+        let mut view = Self { tree, rows, changes: HashMap::new(), selected: None, menu: None, _watcher: watcher };
         view.refresh_git(cx);
         view
     }
 
-    /// Re-reads the folders whose entries changed, and git's view of everything.
+    /// Re-reads the folders whose entries changed, and git's view of everything. `changed` holds
+    /// only paths git doesn't ignore: the ignored ones builds write by the thousand (`target/`,
+    /// `node_modules/`) change nothing the tree shows or git reports.
     fn files_changed(&mut self, changed: &[PathBuf], cx: &mut Context<Self>) {
-        // Builds write thousands of ignored files (target/, node_modules/); they change nothing
-        // the tree shows or git reports.
-        let changed: Vec<&PathBuf> = changed.iter().filter(|path| !self.ignored.is_ignored(path)).collect();
-        if changed.is_empty() {
-            return;
-        }
-        cx.emit(FilesEvent::Changed(changed.iter().map(|path| (*path).clone()).collect()));
+        cx.emit(FilesEvent::Changed(changed.to_vec()));
         let folders: HashSet<PathBuf> = changed
             .iter()
             .filter(|path| !path.components().any(|part| part.as_os_str() == ".git"))
