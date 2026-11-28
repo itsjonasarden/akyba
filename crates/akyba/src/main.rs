@@ -285,8 +285,9 @@ fn open_main_window(project: Option<std::path::PathBuf>, cx: &mut App) {
             traffic_light_position: Some(point(px(14.), px(13.))),
         }),
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1600.), px(1000.)), cx))),
-        // The glass is the window itself: macOS blurs the desktop behind the translucent ground.
-        window_background: WindowBackgroundAppearance::Blurred,
+        // Opaque: the theme paints its own backdrop over the whole window, so a desktop blur behind
+        // it was never seen, and it cost WindowServer a pass on every frame the terminals drew.
+        window_background: WindowBackgroundAppearance::Opaque,
         ..WindowOptions::default()
     };
     // The design system's gallery instead, to see every component in the theme Settings has.

@@ -63,9 +63,6 @@ mod apple_build {
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
             "TransformationMatrix".into(),
-            // Akyba's patch.
-            "BackdropBlurInputIndex".into(),
-            "BackdropBlur".into(),
         ]);
         config.no_includes = true;
         config.enumeration.prefix_with_name = true;

@@ -124,7 +124,6 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
-    backdrop_blurs_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -133,8 +132,6 @@ pub struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
-    /// What was drawn before a backdrop blur, mipmapped, for the blur to read (Akyba's patch).
-    backdrop_texture: Option<metal::Texture>,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -184,8 +181,10 @@ impl MetalRenderer {
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
         layer.set_maximum_drawable_count(3);
-        // Akyba's patch: backdrop blurs copy what's been drawn out of the drawable, so its
-        // texture must be readable. (Upstream allowed this only in debug test builds.)
+        // Allow texture reading for visual tests and UI automation screenshots
+        // (captures without ScreenCaptureKit). Only debug builds pay the
+        // presentation cost, even when `test-support` is compiled in.
+        #[cfg(all(feature = "test-support", debug_assertions))]
         layer.set_framebuffer_only(false);
         // metal-rs doesn't bind these setters, so view the same object through
         // objc2's typed CAMetalLayer binding.
@@ -360,14 +359,6 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
-        let backdrop_blurs_pipeline_state = build_pipeline_state(
-            &device,
-            &library,
-            "backdrop_blurs",
-            "backdrop_blur_vertex",
-            "backdrop_blur_fragment",
-            MTLPixelFormat::BGRA8Unorm,
-        );
 
         let command_queue = device.new_command_queue();
         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
@@ -408,7 +399,6 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
-            backdrop_blurs_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -416,7 +406,6 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
-            backdrop_texture: None,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         }
@@ -803,25 +792,6 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
-                PrimitiveBatch::BackdropBlurs(range) => {
-                    // Copy what has been drawn so far, then blur from the copy.
-                    command_encoder.end_encoding();
-                    let copied = self.copy_to_backdrop(texture, viewport_size, command_buffer);
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        texture,
-                        viewport_size,
-                        None,
-                    );
-                    if copied {
-                        self.draw_backdrop_blurs(
-                            range,
-                            instance_bindings,
-                            viewport_size,
-                            command_encoder,
-                        );
-                    }
-                }
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
@@ -940,104 +910,6 @@ impl MetalRenderer {
             6,
             shadows.len() as u64,
             shadows.start as u64,
-        );
-    }
-
-    /// Copies `texture` into the backdrop texture and builds its mip levels, so backdrop blurs
-    /// can read what was drawn before them (Akyba's patch).
-    fn copy_to_backdrop(
-        &mut self,
-        texture: &metal::TextureRef,
-        viewport_size: Size<DevicePixels>,
-        command_buffer: &metal::CommandBufferRef,
-    ) -> bool {
-        let (width, height) = (viewport_size.width.0, viewport_size.height.0);
-        if width <= 0 || height <= 0
-            || texture.width() != width as u64
-            || texture.height() != height as u64
-            || texture.pixel_format() != MTLPixelFormat::BGRA8Unorm
-        {
-            return false;
-        }
-        let stale = self.backdrop_texture.as_ref().is_none_or(|backdrop| {
-            backdrop.width() != width as u64 || backdrop.height() != height as u64
-        });
-        if stale {
-            let levels = u32::BITS - (width.max(height) as u32).leading_zeros();
-            let descriptor = metal::TextureDescriptor::new();
-            descriptor.set_width(width as u64);
-            descriptor.set_height(height as u64);
-            descriptor.set_mipmap_level_count(levels as u64);
-            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
-            descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
-            self.backdrop_texture = Some(self.device.new_texture(&descriptor));
-        }
-        let Some(backdrop) = &self.backdrop_texture else {
-            return false;
-        };
-        let blit = command_buffer.new_blit_command_encoder();
-        let origin = metal::MTLOrigin { x: 0, y: 0, z: 0 };
-        let size = metal::MTLSize {
-            width: width as u64,
-            height: height as u64,
-            depth: 1,
-        };
-        blit.copy_from_texture(texture, 0, 0, origin, size, backdrop, 0, 0, origin);
-        blit.generate_mipmaps(backdrop);
-        blit.end_encoding();
-        true
-    }
-
-    fn draw_backdrop_blurs(
-        &self,
-        blurs: Range<usize>,
-        instance_bindings: &InstanceBindings,
-        viewport_size: Size<DevicePixels>,
-        command_encoder: &metal::RenderCommandEncoderRef,
-    ) {
-        let Some(backdrop) = &self.backdrop_texture else {
-            return;
-        };
-        if blurs.is_empty() {
-            return;
-        }
-
-        command_encoder.set_render_pipeline_state(&self.backdrop_blurs_pipeline_state);
-        command_encoder.set_vertex_buffer(
-            BackdropBlurInputIndex::Vertices as u64,
-            Some(&self.unit_vertices),
-            0,
-        );
-        command_encoder.set_vertex_buffer(
-            BackdropBlurInputIndex::BackdropBlurs as u64,
-            Some(&instance_bindings.backdrop_blurs.buffer),
-            instance_bindings.backdrop_blurs.offset as u64,
-        );
-        command_encoder.set_fragment_buffer(
-            BackdropBlurInputIndex::BackdropBlurs as u64,
-            Some(&instance_bindings.backdrop_blurs.buffer),
-            instance_bindings.backdrop_blurs.offset as u64,
-        );
-        command_encoder.set_vertex_bytes(
-            BackdropBlurInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
-        );
-        command_encoder.set_fragment_bytes(
-            BackdropBlurInputIndex::ViewportSize as u64,
-            mem::size_of_val(&viewport_size) as u64,
-            &viewport_size as *const Size<DevicePixels> as *const _,
-        );
-        command_encoder
-            .set_fragment_texture(BackdropBlurInputIndex::Backdrop as u64, Some(backdrop));
-
-        command_encoder.draw_primitives_instanced_base_instance(
-            metal::MTLPrimitiveType::Triangle,
-            0,
-            6,
-            blurs.len() as u64,
-            blurs.start as u64,
         );
     }
 
@@ -1590,7 +1462,6 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
     surfaces: InstanceBinding,
-    backdrop_blurs: InstanceBinding,
 }
 
 fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<InstanceBindings> {
@@ -1604,7 +1475,6 @@ fn write_instances(scene: &Scene, writer: &mut InstanceBufferWriter) -> Result<I
             bounds: surface.bounds,
             content_mask: surface.content_mask,
         }))?,
-        backdrop_blurs: writer.write(&scene.backdrop_blurs)?,
     })
 }
 
@@ -1767,14 +1637,6 @@ enum SpriteInputIndex {
     ViewportSize = 2,
     AtlasTextureSize = 3,
     AtlasTexture = 4,
-}
-
-#[repr(C)]
-enum BackdropBlurInputIndex {
-    Vertices = 0,
-    BackdropBlurs = 1,
-    ViewportSize = 2,
-    Backdrop = 3,
 }
 
 #[repr(C)]

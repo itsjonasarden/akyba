@@ -33,8 +33,7 @@ pub fn layers(layers: &[Shadow]) -> Vec<BoxShadow> {
 }
 
 // Layering, after how macOS builds its windows: the chrome (title bar, sidebar, the gaps between
-// panes) is clear, so the window's own sidebar material shows: blur, saturation, a fill and a
-// brightness clamp, drawn by macOS. Content (terminals, the editor) sits on opaque cards. Strokes
+// panes) is clear, so the theme's backdrop shows. Content (terminals, the editor) sits on cards. Strokes
 // and control fills on either are relative, black in light mode and white in dark at a low alpha,
 // so they read the same over any background, as AppKit's separator and fill colours do.
 
@@ -80,8 +79,8 @@ fn component_theme(appearance: Appearance) -> gpui_kit::component::ThemeConfig {
         format!("#{base}{:02x}", (alpha * 255.).round() as u8)
     };
     let colors = serde_json::json!({
-        // The root view paints this under the whole window; clear, so the glass (the desktop's
-        // blur through the ground and the panes) shows. Dialogs, which also default to it, set
+        // The root view paints this under the whole window; clear, so the theme's backdrop
+        // shows. Dialogs, which also default to it, set
         // their own surface (chrome::dialog_surface).
         "background": "#00000000",
         "foreground": hex(c::INK),
