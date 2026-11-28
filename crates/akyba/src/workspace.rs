@@ -22,7 +22,7 @@ use akyba_core::recipe::{self, Source};
 use akyba_core::routines::Routine;
 use akyba_core::servers::{self, Server, Service};
 use akyba_core::session_name::rename_for_prompt;
-use akyba_core::session_usage::{self, Tokens};
+use akyba_core::session_usage::{self, Tally, Tokens};
 use akyba_core::shared_env;
 use akyba_core::snapshot::{self, Snapshot};
 use akyba_core::teams::{self, Team};
@@ -401,6 +401,9 @@ pub struct Workspace {
     transcripts: HashMap<TabId, PathBuf>,
     /// What each tab's session used in the plan's current 5-hour window.
     spent: HashMap<TabId, Tokens>,
+    /// Each tab's transcript as read so far, so the next read takes only what was added; `None`
+    /// while a read has them.
+    tallies: Option<HashMap<TabId, Tally>>,
     /// What each tab's agent waits for, from its hooks.
     waits: HashMap<TabId, Waiting>,
     /// The button menu that's open, if one is.
@@ -1119,11 +1122,11 @@ impl Workspace {
             }
         })
         .detach();
-        // Servers start and stop without telling anyone; reading them takes a few hundredths of a
-        // second, so every few seconds keeps the chips current.
+        // Servers start and stop without telling anyone. Reading them runs `ps`, `lsof` and
+        // `docker ps` (which wakes Docker's VM), so every ten seconds: current enough for a chip.
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_secs(3)).await;
+                cx.background_executor().timer(Duration::from_secs(10)).await;
                 if this.update(cx, Workspace::refresh_servers).is_err() {
                     break;
                 }
@@ -1198,6 +1201,7 @@ impl Workspace {
             turns: HashMap::new(),
             transcripts: HashMap::new(),
             spent: HashMap::new(),
+            tallies: Some(HashMap::new()),
             waits: HashMap::new(),
             open_menu: None,
             menu_dismissed: None,
@@ -2491,24 +2495,30 @@ impl Workspace {
 
     /// Reads what each tab's session used in the plan's current 5-hour window, off the main thread.
     fn refresh_spent(&mut self, cx: &mut Context<Self>) {
+        // One read at a time: the next turn's end finds the transcripts read and starts another.
+        let Some(mut tallies) = self.tallies.take() else { return };
         let since = crate::usage::window_start(cx);
         let transcripts: Vec<(TabId, PathBuf)> =
             self.transcripts.iter().map(|(tab, path)| (*tab, path.clone())).collect();
         cx.spawn(async move |this, cx| {
-            let spent = cx
+            let (spent, tallies) = cx
                 .background_spawn(async move {
-                    transcripts
+                    tallies.retain(|tab, _| transcripts.iter().any(|(open, _)| open == tab));
+                    let spent = transcripts
                         .into_iter()
-                        .filter_map(|(tab, path)| {
-                            let file = std::fs::File::open(path).ok()?;
-                            let lines = std::io::BufRead::lines(std::io::BufReader::new(file)).map_while(Result::ok);
-                            Some((tab, session_usage::read(lines, Some(since))))
+                        .map(|(tab, path)| {
+                            let tally = tallies.entry(tab).or_default();
+                            tally.read_new(&path);
+                            tally.forget_before(since);
+                            (tab, tally.since(since))
                         })
-                        .collect::<HashMap<TabId, Tokens>>()
+                        .collect::<HashMap<TabId, Tokens>>();
+                    (spent, tallies)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.spent = spent;
+                this.tallies = Some(tallies);
                 this.write_shares(cx);
             });
         })

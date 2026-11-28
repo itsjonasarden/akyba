@@ -42,44 +42,89 @@ pub fn iso_to_unix(text: &str) -> Option<i64> {
 /// The tokens of the replies in a transcript since `since` (Unix seconds; `None` for all of them).
 /// A reply is written once per part, each with the same usage, so each counts once.
 pub fn read(lines: impl Iterator<Item = String>, since: Option<i64>) -> Tokens {
-    let mut seen = std::collections::HashMap::<String, Tokens>::new();
+    let mut tally = Tally::default();
     for line in lines {
-        if !line.contains("\"usage\"") {
-            continue;
+        tally.add(&line);
+    }
+    tally.since(since.unwrap_or(i64::MIN))
+}
+
+/// A transcript read a little at a time: it only grows, so each read takes up where the last
+/// stopped instead of parsing a session of many megabytes again.
+#[derive(Debug, Default)]
+pub struct Tally {
+    path: std::path::PathBuf,
+    /// How far the file has been read: the end of its last whole line.
+    read_to: u64,
+    /// Each reply's time and largest usage, by its message id.
+    replies: std::collections::HashMap<String, (i64, Tokens)>,
+}
+
+impl Tally {
+    /// Reads what `path` gained since the last read: a line still being written waits for the
+    /// next one. A different file, or one that shrank, is read from the start.
+    pub fn read_new(&mut self, path: &std::path::Path) {
+        use std::io::{BufRead as _, Seek as _};
+        let Ok(mut file) = std::fs::File::open(path) else { return };
+        let length = file.metadata().map_or(0, |meta| meta.len());
+        if self.path != path || length < self.read_to {
+            *self = Self { path: path.to_owned(), ..Self::default() };
         }
-        let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
-        if entry.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
+        if length == self.read_to || file.seek(std::io::SeekFrom::Start(self.read_to)).is_err() {
+            return;
         }
-        if let Some(since) = since {
-            let at = entry.get("timestamp").and_then(Value::as_str).and_then(iso_to_unix);
-            if at.is_none_or(|at| at < since) {
-                continue;
+        let mut reader = std::io::BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(read) if read > 0 && line.ends_with('\n') => {
+                    self.read_to += read as u64;
+                    self.add(&line);
+                }
+                _ => break,
             }
         }
-        let Some(message) = entry.get("message") else { continue };
-        let Some(usage) = message.get("usage") else { continue };
+    }
+
+    /// Counts one line of a transcript, if it's a reply with usage.
+    pub fn add(&mut self, line: &str) {
+        if !line.contains("\"usage\"") {
+            return;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else { return };
+        if entry.get("type").and_then(Value::as_str) != Some("assistant") {
+            return;
+        }
+        let at = entry.get("timestamp").and_then(Value::as_str).and_then(iso_to_unix).unwrap_or(i64::MIN);
+        let Some(message) = entry.get("message") else { return };
+        let Some(usage) = message.get("usage") else { return };
         let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-        let tokens = Tokens {
-            input: count("input_tokens"),
-            output: count("output_tokens"),
-            cache_write: count("cache_creation_input_tokens"),
-            cache_read: count("cache_read_input_tokens"),
-        };
         let id = message.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
         // The last part has the reply's final output count; keep the largest of each.
-        let kept = seen.entry(id).or_default();
-        kept.input = kept.input.max(tokens.input);
-        kept.output = kept.output.max(tokens.output);
-        kept.cache_write = kept.cache_write.max(tokens.cache_write);
-        kept.cache_read = kept.cache_read.max(tokens.cache_read);
+        let (kept_at, kept) = self.replies.entry(id).or_insert((at, Tokens::default()));
+        *kept_at = (*kept_at).max(at);
+        kept.input = kept.input.max(count("input_tokens"));
+        kept.output = kept.output.max(count("output_tokens"));
+        kept.cache_write = kept.cache_write.max(count("cache_creation_input_tokens"));
+        kept.cache_read = kept.cache_read.max(count("cache_read_input_tokens"));
     }
-    seen.values().fold(Tokens::default(), |sum, tokens| Tokens {
-        input: sum.input + tokens.input,
-        output: sum.output + tokens.output,
-        cache_write: sum.cache_write + tokens.cache_write,
-        cache_read: sum.cache_read + tokens.cache_read,
-    })
+
+    /// The tokens of the replies since `since` (Unix seconds).
+    pub fn since(&self, since: i64) -> Tokens {
+        self.replies.values().filter(|(at, _)| *at >= since).fold(Tokens::default(), |sum, (_, tokens)| Tokens {
+            input: sum.input + tokens.input,
+            output: sum.output + tokens.output,
+            cache_write: sum.cache_write + tokens.cache_write,
+            cache_read: sum.cache_read + tokens.cache_read,
+        })
+    }
+
+    /// Forgets the replies before `since`: the plan's window only moves forward, so they never
+    /// count again.
+    pub fn forget_before(&mut self, since: i64) {
+        self.replies.retain(|_, (at, _)| *at >= since);
+    }
 }
 
 /// A count of tokens in a few characters: `950`, `12k`, `1.2M`.
@@ -119,6 +164,30 @@ mod tests {
         assert_eq!(tokens, Tokens { input: 15, output: 60, cache_write: 100, cache_read: 12_000 });
         assert_eq!(tokens.counted(), 175);
         assert_eq!(read(transcript.lines().map(str::to_owned), None).input, 1014);
+    }
+
+    #[test]
+    fn a_growing_transcript_is_read_from_where_it_stopped() {
+        let dir = tempfile::tempdir().expect("a temporary folder");
+        let path = dir.path().join("session.jsonl");
+        let reply = |id: &str, output: u64| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"2026-10-20T10:00:00Z","message":{{"id":"{id}","usage":{{"input_tokens":1,"output_tokens":{output}}}}}}}"#
+            )
+        };
+        std::fs::write(&path, format!("{}\n{}", reply("m1", 10), &reply("m2", 5)[..20])).expect("written");
+        let mut tally = Tally::default();
+        tally.read_new(&path);
+        // The half-written second reply waits.
+        assert_eq!(tally.since(0).output, 10);
+        std::fs::write(&path, format!("{}\n{}\n{}\n", reply("m1", 10), reply("m2", 5), reply("m1", 30)))
+            .expect("written");
+        tally.read_new(&path);
+        assert_eq!(tally.since(0), Tokens { input: 2, output: 35, cache_write: 0, cache_read: 0 });
+        // Started again (a new, shorter file): read from the start.
+        std::fs::write(&path, format!("{}\n", reply("m9", 7))).expect("written");
+        tally.read_new(&path);
+        assert_eq!(tally.since(0).output, 7);
     }
 
     #[test]
